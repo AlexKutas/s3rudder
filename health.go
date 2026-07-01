@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -136,8 +137,9 @@ func isNotFound(err error) bool {
 		return false
 	}
 	type httpStatusCoder interface{ HTTPStatusCode() int }
-	if e, ok := err.(httpStatusCoder); ok {
-		return e.HTTPStatusCode() == http.StatusNotFound
+	var coder httpStatusCoder
+	if errors.As(err, &coder) {
+		return coder.HTTPStatusCode() == http.StatusNotFound
 	}
 	return false
 }

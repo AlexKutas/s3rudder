@@ -77,6 +77,8 @@ func ValidateRequest(r *http.Request, accessKey, secretKey string) error {
 	sig := computeSignature(secretKey, t.Format("20060102"), region, "s3", stringToSign)
 
 	if !hmac.Equal([]byte(sig), []byte(fields["Signature"])) {
+		log.Printf("[signer] signature mismatch!\nCalculated: %s\nClient:     %s\nStringToSign:\n%s\nCanonicalRequest:\n%s",
+			sig, fields["Signature"], stringToSign, canonical)
 		return fmt.Errorf("signature mismatch")
 	}
 	return nil
@@ -246,6 +248,9 @@ func canonicalizeQuery(rawQuery string) string {
 	for _, pair := range pairs {
 		if strings.HasPrefix(pair, "X-Amz-Signature=") {
 			continue
+		}
+		if !strings.Contains(pair, "=") {
+			pair = pair + "="
 		}
 		filtered = append(filtered, pair)
 	}

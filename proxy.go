@@ -125,29 +125,40 @@ func (rt *Router) runPeriodicCleanup(ctx context.Context) {
 
 // ServeHTTP is the main entry point for all incoming S3-protocol requests.
 func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// ── 0. Health-check shortcut ───────────────────────────────────────────
-	// Allow unauthenticated GET / or HEAD / so load-balancers and tools like
-	// `mc ping` can verify the router is alive without S3 credentials.
-	if r.URL.Path == "/" && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
-		w.Header().Set("Content-Type", "application/xml")
-		w.WriteHeader(http.StatusOK)
-		if r.Method == http.MethodGet {
-			fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?><ListAllMyBucketsResult></ListAllMyBucketsResult>`)
+	// ── 0. Parse S3 path ──────────────────────────────────────────────────
+	bucket, objectKey := parseS3Path(r)
+
+	// ── 1. Health-check / ListBuckets shortcut ─────────────────────────────
+	// Allow unauthenticated GET / or HEAD / so load-balancers can verify the
+	// router is alive, but authenticate and return bucket list if auth is sent.
+	if bucket == "" && r.URL.Path == "/" && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+		hasAuth := r.Header.Get("Authorization") != "" || r.URL.Query().Get("X-Amz-Signature") != ""
+		if hasAuth {
+			if err := ValidateRequest(r, rt.cfg.Server.AccessKey, rt.cfg.Server.SecretKey); err != nil {
+				log.Printf("[proxy] auth error on ListBuckets: %v", err)
+				writeS3Error(w, http.StatusForbidden, "AccessDenied", err.Error())
+				return
+			}
+			rt.handleListBuckets(w, r)
+		} else {
+			w.Header().Set("Content-Type", "application/xml")
+			w.WriteHeader(http.StatusOK)
+			if r.Method == http.MethodGet {
+				fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?><ListAllMyBucketsResult></ListAllMyBucketsResult>`)
+			}
 		}
 		return
 	}
 
-	// ── 1. Authenticate ───────────────────────────────────────────────────
-	if err := ValidateRequest(r, rt.cfg.Server.AccessKey, rt.cfg.Server.SecretKey); err != nil {
-		log.Printf("[proxy] auth error: %v", err)
-		writeS3Error(w, http.StatusForbidden, "AccessDenied", err.Error())
+	if bucket == "" {
+		writeS3Error(w, http.StatusBadRequest, "InvalidRequest", "cannot determine bucket from request")
 		return
 	}
 
-	// ── 2. Parse S3 path ──────────────────────────────────────────────────
-	bucket, objectKey := parseS3Path(r)
-	if bucket == "" {
-		writeS3Error(w, http.StatusBadRequest, "InvalidRequest", "cannot determine bucket from request")
+	// ── 2. Authenticate ───────────────────────────────────────────────────
+	if err := ValidateRequest(r, rt.cfg.Server.AccessKey, rt.cfg.Server.SecretKey); err != nil {
+		log.Printf("[proxy] auth error: %v", err)
+		writeS3Error(w, http.StatusForbidden, "AccessDenied", err.Error())
 		return
 	}
 
@@ -364,7 +375,8 @@ func (rt *Router) handlePassthrough(w http.ResponseWriter, r *http.Request) {
 	b := candidates[0]
 	log.Printf("[proxy] passthrough %s %s → %s", r.Method, r.URL.RequestURI(), b.Config.Name)
 
-	resp, err := rt.forwardHTTPToBackend(r, b, "")
+	_, objectKey := parseS3Path(r)
+	resp, err := rt.forwardHTTPToBackend(r, b, objectKey)
 	if err != nil {
 		log.Printf("[proxy] passthrough forward error on %s: %v", b.Config.Name, err)
 		writeS3Error(w, http.StatusBadGateway, "ServiceUnavailable", err.Error())
@@ -388,7 +400,8 @@ func (rt *Router) handlePassthrough(w http.ResponseWriter, r *http.Request) {
 // forwardHTTP clones the incoming request, re-points it at the backend,
 // re-signs it, and streams the response to w.
 func (rt *Router) forwardHTTP(w http.ResponseWriter, r *http.Request, b *Backend) error {
-	resp, err := rt.forwardHTTPToBackend(r, b, "")
+	_, objectKey := parseS3Path(r)
+	resp, err := rt.forwardHTTPToBackend(r, b, objectKey)
 	if err != nil {
 		return err
 	}
@@ -422,9 +435,19 @@ func (rt *Router) forwardHTTPToBackend(r *http.Request, b *Backend, objectKey st
 	outReq.Host = outReq.URL.Host
 	outReq.RequestURI = ""
 
-	// Rewrite path for path-style backends: /<bucket>/<key>
-	if b.Config.PathStyle && objectKey != "" {
-		outReq.URL.Path = "/" + b.Config.Bucket + "/" + strings.TrimPrefix(objectKey, "/")
+	// Rewrite path and host correctly based on backend style.
+	if b.Config.PathStyle {
+		outReq.URL.Path = "/" + b.Config.Bucket
+		if objectKey != "" {
+			outReq.URL.Path += "/" + strings.TrimPrefix(objectKey, "/")
+		}
+	} else {
+		// Virtual-hosted style: /<key>
+		outReq.URL.Path = "/" + strings.TrimPrefix(objectKey, "/")
+		// Prepend bucket name to host
+		bucketHost := b.Config.Bucket + "." + outReq.URL.Host
+		outReq.URL.Host = bucketHost
+		outReq.Host = bucketHost
 	}
 
 	payloadHash := r.Header.Get("x-amz-content-sha256")
@@ -477,4 +500,35 @@ func writeS3Error(w http.ResponseWriter, status int, code, message string) {
   <Code>%s</Code>
   <Message>%s</Message>
 </Error>`, code, message)
+}
+
+// handleListBuckets returns an S3-compatible list of configured buckets.
+func (rt *Router) handleListBuckets(w http.ResponseWriter, r *http.Request) {
+	uniqueBuckets := make(map[string]bool)
+	var bucketsList []string
+	for _, b := range rt.backends {
+		if b.Config.Bucket != "" && !uniqueBuckets[b.Config.Bucket] {
+			uniqueBuckets[b.Config.Bucket] = true
+			bucketsList = append(bucketsList, b.Config.Bucket)
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/xml")
+	w.WriteHeader(http.StatusOK)
+	if r.Method == http.MethodHead {
+		return
+	}
+
+	var sb strings.Builder
+	sb.WriteString(`<?xml version="1.0" encoding="UTF-8"?>`)
+	sb.WriteString(`<ListAllMyBucketsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">`)
+	sb.WriteString(`<Buckets>`)
+	for _, bucketName := range bucketsList {
+		sb.WriteString(fmt.Sprintf("<Bucket><Name>%s</Name><CreationDate>%s</CreationDate></Bucket>", 
+			bucketName, time.Now().Format("2006-01-02T15:04:05.000Z")))
+	}
+	sb.WriteString(`</Buckets>`)
+	sb.WriteString(`<Owner><ID>s3rudder-owner-id</ID><DisplayName>s3rudder</DisplayName></Owner>`)
+	sb.WriteString(`</ListAllMyBucketsResult>`)
+	fmt.Fprint(w, sb.String())
 }

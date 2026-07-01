@@ -1,0 +1,80 @@
+services:
+  # ── MinIO primary (simulates AWS / main provider) ──────────────────────────
+  minio-primary:
+    image: minio/minio:latest
+    container_name: minio-primary
+    ports:
+      - "9001:9000"   # S3 API
+      - "9091:9090"   # MinIO Console
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9090"
+    volumes:
+      - minio-primary-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── MinIO secondary (simulates R2 / backup provider) ──────────────────────
+  minio-secondary:
+    image: minio/minio:latest
+    container_name: minio-secondary
+    ports:
+      - "9002:9000"   # S3 API
+      - "9092:9090"   # MinIO Console
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9090"
+    volumes:
+      - minio-secondary-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── MinIO init: creates buckets and seeds the canary object ───────────────
+  minio-init:
+    image: minio/mc:latest
+    container_name: minio-init
+    depends_on:
+      minio-primary:
+        condition: service_healthy
+      minio-secondary:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set primary http://minio-primary:9000 minioadmin minioadmin;
+        mc alias set secondary http://minio-secondary:9000 minioadmin minioadmin;
+        mc mb --ignore-existing primary/test-bucket;
+        mc mb --ignore-existing secondary/test-bucket2;
+        echo 'ok' | mc pipe primary/test-bucket/.s3rudder-health;
+        echo 'ok' | mc pipe secondary/test-bucket2/.s3rudder-health;
+        echo 'Buckets and canary objects created.';
+      "
+
+  # ── S3Rudder ──────────────────────────────────────────────────────────────
+  s3rudder:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: s3rudder
+    user: "0:0"
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config.dev.yaml:/etc/s3rudder/config.yaml:ro
+      - s3rudder-queue:/data
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  minio-primary-data:
+  minio-secondary-data:
+  s3rudder-queue:

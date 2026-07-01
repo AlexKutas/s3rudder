@@ -1,0 +1,47 @@
+server:
+  port: 8080
+  access_key: "rudder-key"
+  secret_key: "rudder-secret"
+
+backends:
+  - name: "minio-primary"
+    endpoint: "http://minio-primary:9000"
+    region: "us-east-1"
+    access_key: "minioadmin"
+    secret_key: "minioadmin"
+    bucket: "test-bucket"
+    weight: 70
+    path_style: true   # MinIO requires path-style
+    health_check:
+      object_key: ".s3rudder-health"
+      interval: "10s"
+      timeout: "5s"
+
+  - name: "minio-secondary"
+    endpoint: "http://minio-secondary:9000"
+    region: "us-east-1"
+    access_key: "minioadmin"
+    secret_key: "minioadmin"
+    bucket: "test-bucket2"
+    weight: 30
+    path_style: true
+    health_check:
+      object_key: ".s3rudder-health"
+      interval: "10s"
+      timeout: "5s"
+
+routing:
+  read_policy: "failover"
+  write_policy: "weight_async"
+  read_mode: "proxy"
+  redirect_ttl: "15m"
+  sync_interval: "1m" # автоматичне періодичне звірення та синхронізація кожні 30 хвилин
+  cleanup_interval: "2m" # автоматичне очищення файлів-сиріт кожні 2 хвилини
+
+
+
+queue:
+  db_path: "/data/queue.db"
+  workers: 4
+  retry_limit: 5
+  retry_backoff: "5s"

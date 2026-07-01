@@ -1,0 +1,75 @@
+server:
+  port: 8080
+  # Credentials that clients use to authenticate with S3Rudder.
+  # Clients configure their AWS SDK / CLI to use these as if they were
+  # regular IAM credentials pointing at http://localhost:8080.
+  access_key: "rudder-access-key"
+  secret_key: "rudder-secret-key"
+
+backends:
+  - name: "aws-us-east"
+    endpoint: "https://s3.us-east-1.amazonaws.com"
+    region: "us-east-1"
+    access_key: "AWS_ACCESS_KEY_ID"
+    secret_key: "AWS_SECRET_ACCESS_KEY"
+    bucket: "my-primary-bucket"
+    weight: 70        # 70 % of write traffic goes here
+    path_style: false # virtual-host style (default for AWS)
+    health_check:
+      object_key: ".s3rudder-health"
+      interval: "15s"
+      timeout: "5s"
+
+  - name: "cloudflare-r2"
+    endpoint: "https://<account-id>.r2.cloudflarestorage.com"
+    region: "auto"
+    access_key: "R2_ACCESS_KEY_ID"
+    secret_key: "R2_SECRET_ACCESS_KEY"
+    bucket: "my-backup-bucket"
+    weight: 30        # 30 % of write traffic goes here
+    path_style: true  # R2 requires path-style
+    health_check:
+      object_key: ".s3rudder-health"
+      interval: "15s"
+      timeout: "5s"
+
+# ── Routing policies ──────────────────────────────────────────────────────
+routing:
+  # read_policy: how a backend is chosen for GET / HEAD / ListObjects
+  #   failover    — try backends by weight order; fall back on 5xx / timeout
+  #   round-robin — spread reads across all healthy backends evenly
+  #   latency     — always pick the fastest (lowest measured latency) backend
+  read_policy: "failover"
+
+  # write_policy: how PUT / DELETE / CreateMultipartUpload are handled
+  #   weight_async — pick one backend by weight, queue async replication to others
+  #   primary_only — write only to the highest-weight backend (no replication)
+  write_policy: "weight_async"
+
+  # read_mode: how GET responses are delivered to the client
+  #   proxy    — stream the object body through the rudder (safe default)
+  #   redirect — return HTTP 302 with a Pre-signed URL so the client fetches
+  #              directly from the chosen S3 backend. Saves rudder bandwidth
+  #              and enables geo-aware routing in future.
+  read_mode: "proxy"
+
+  # redirect_ttl: Pre-signed URL lifetime when read_mode is "redirect"
+  redirect_ttl: "15m"
+
+  # sync_interval: how often to run full background bucket reconciliation
+  #   "1h"   — compare all objects and sync missing ones every hour
+  #   "0"    — disable periodic background sync (default)
+  sync_interval: "0"
+
+  # cleanup_interval: how often to run background orphan cleanup (deletion)
+  #   "12h"  — identify and delete files in backends that are no longer on primary
+  #   "0"    — disable periodic background cleanup (default)
+  cleanup_interval: "0"
+
+
+# ── Replication queue (BoltDB) ────────────────────────────────────────────
+queue:
+  db_path: "queue.db"   # path to the persistent BoltDB database file
+  workers: 4            # concurrent replication workers
+  retry_limit: 5        # retries before a task is moved to dead-letter
+  retry_backoff: "5s"   # base back-off duration (doubled on each retry)

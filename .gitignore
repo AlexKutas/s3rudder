@@ -1,0 +1,42 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Go workspace file
+go.work
+go.work.sum
+
+# IDEs and editors
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS-specific files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+
+# Project-specific binaries and builds
+s3rudder
+dist/
+bin/
+
+# Local database file (if created locally instead of /data/queue.db)
+*.db
+
+# Local configuration overrides
+config.local.yaml
+config.local.yml

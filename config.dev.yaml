@@ -35,8 +35,8 @@ routing:
   write_policy: "weight_async"
   read_mode: "proxy"
   redirect_ttl: "15m"
-  sync_interval: "1m" # автоматичне періодичне звірення та синхронізація кожні 30 хвилин
-  cleanup_interval: "2m" # автоматичне очищення файлів-сиріт кожні 2 хвилини
+  sync_interval: "1m" # automatic periodic reconciliation and synchronization
+  cleanup_interval: "2m" # automatic cleanup of orphan files every 2 minutes
 
 
 

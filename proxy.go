@@ -125,12 +125,21 @@ func (rt *Router) runPeriodicCleanup(ctx context.Context) {
 
 // ServeHTTP is the main entry point for all incoming S3-protocol requests.
 func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// ── 0. Parse S3 path ──────────────────────────────────────────────────
+	// ── 0. Health-check endpoint (unauthenticated) ─────────────────────────
+	if r.URL.Path == "/healthz" && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		if r.Method == http.MethodGet {
+			fmt.Fprint(w, "OK")
+		}
+		return
+	}
+
+	// ── 1. Parse S3 path ──────────────────────────────────────────────────
 	bucket, objectKey := parseS3Path(r)
 
-	// ── 1. Health-check / ListBuckets shortcut ─────────────────────────────
-	// Allow unauthenticated GET / or HEAD / so load-balancers can verify the
-	// router is alive, but authenticate and return bucket list if auth is sent.
+	// ── 2. Health-check / ListBuckets shortcut ─────────────────────────────
+	// Authenticate and return bucket list if auth is sent, otherwise reject.
 	if bucket == "" && r.URL.Path == "/" && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
 		hasAuth := r.Header.Get("Authorization") != "" || r.URL.Query().Get("X-Amz-Signature") != ""
 		if hasAuth {
@@ -141,11 +150,7 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			rt.handleListBuckets(w, r)
 		} else {
-			w.Header().Set("Content-Type", "application/xml")
-			w.WriteHeader(http.StatusOK)
-			if r.Method == http.MethodGet {
-				fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?><ListAllMyBucketsResult></ListAllMyBucketsResult>`)
-			}
+			writeS3Error(w, http.StatusForbidden, "AccessDenied", "Anonymous Access Denied")
 		}
 		return
 	}

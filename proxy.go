@@ -136,7 +136,7 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// ── 1. Parse S3 path ──────────────────────────────────────────────────
-	bucket, objectKey := parseS3Path(r)
+	bucket, objectKey := rt.parseS3Path(r)
 
 	// ── 2. Health-check / ListBuckets shortcut ─────────────────────────────
 	// Authenticate and return bucket list if auth is sent, otherwise reject.
@@ -380,7 +380,7 @@ func (rt *Router) handlePassthrough(w http.ResponseWriter, r *http.Request) {
 	b := candidates[0]
 	log.Printf("[proxy] passthrough %s %s → %s", r.Method, r.URL.RequestURI(), b.Config.Name)
 
-	_, objectKey := parseS3Path(r)
+	_, objectKey := rt.parseS3Path(r)
 	resp, err := rt.forwardHTTPToBackend(r, b, objectKey)
 	if err != nil {
 		log.Printf("[proxy] passthrough forward error on %s: %v", b.Config.Name, err)
@@ -405,7 +405,7 @@ func (rt *Router) handlePassthrough(w http.ResponseWriter, r *http.Request) {
 // forwardHTTP clones the incoming request, re-points it at the backend,
 // re-signs it, and streams the response to w.
 func (rt *Router) forwardHTTP(w http.ResponseWriter, r *http.Request, b *Backend) error {
-	_, objectKey := parseS3Path(r)
+	_, objectKey := rt.parseS3Path(r)
 	resp, err := rt.forwardHTTPToBackend(r, b, objectKey)
 	if err != nil {
 		return err
@@ -474,18 +474,46 @@ func (rt *Router) forwardHTTPToBackend(r *http.Request, b *Backend, objectKey st
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 // parseS3Path extracts the bucket and object key from the request URL.
-// Supports both virtual-host style (bucket.router.local/key) and
-// path style (router.local/bucket/key).
-func parseS3Path(r *http.Request) (bucket, objectKey string) {
+// Supports both virtual-host style (bucket.router.local/key or bucket.s3.example.com/key)
+// and path style (router.local/bucket/key or s3.example.com/bucket/key).
+func (rt *Router) parseS3Path(r *http.Request) (bucket, objectKey string) {
 	host := r.Host
-	// Virtual-host style: the first label of the Host header is the bucket.
-	// e.g.  my-bucket.s3rudder.local:8080 → bucket=my-bucket
-	if idx := strings.Index(host, "."); idx > 0 {
-		bucket = host[:idx]
-		objectKey = strings.TrimPrefix(r.URL.Path, "/")
-		return
+	if idx := strings.Index(host, ":"); idx != -1 {
+		host = host[:idx]
 	}
-	// Path style: /bucket/key/...
+
+	// 1. If server domain is explicitly configured (e.g. s3.example.com):
+	if rt != nil && rt.cfg != nil && rt.cfg.Server.Domain != "" {
+		domain := rt.cfg.Server.Domain
+		if idx := strings.Index(domain, ":"); idx != -1 {
+			domain = domain[:idx]
+		}
+		if host == domain {
+			return rt.parsePathStyle(r)
+		}
+		if strings.HasSuffix(host, "."+domain) {
+			bucket = strings.TrimSuffix(host, "."+domain)
+			objectKey = strings.TrimPrefix(r.URL.Path, "/")
+			return
+		}
+	}
+
+	// 2. Virtual-host style heuristic:
+	// Check if the first label of Host matches a known configured bucket.
+	if idx := strings.Index(host, "."); idx > 0 {
+		candidate := host[:idx]
+		if rt.isKnownBucket(candidate) {
+			bucket = candidate
+			objectKey = strings.TrimPrefix(r.URL.Path, "/")
+			return
+		}
+	}
+
+	// 3. Fall back to path style: /bucket/key/...
+	return rt.parsePathStyle(r)
+}
+
+func (rt *Router) parsePathStyle(r *http.Request) (bucket, objectKey string) {
 	parts := strings.SplitN(strings.TrimPrefix(r.URL.Path, "/"), "/", 2)
 	if len(parts) >= 1 {
 		bucket = parts[0]
@@ -494,6 +522,18 @@ func parseS3Path(r *http.Request) (bucket, objectKey string) {
 		objectKey = parts[1]
 	}
 	return
+}
+
+func (rt *Router) isKnownBucket(name string) bool {
+	if rt == nil || name == "" {
+		return false
+	}
+	for _, b := range rt.backends {
+		if b != nil && b.Config.Bucket == name {
+			return true
+		}
+	}
+	return false
 }
 
 // writeS3Error writes an S3-compatible XML error response.
@@ -527,13 +567,13 @@ func (rt *Router) handleListBuckets(w http.ResponseWriter, r *http.Request) {
 	var sb strings.Builder
 	sb.WriteString(`<?xml version="1.0" encoding="UTF-8"?>`)
 	sb.WriteString(`<ListAllMyBucketsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">`)
+	sb.WriteString(`<Owner><ID>s3rudder-owner-id</ID><DisplayName>s3rudder</DisplayName></Owner>`)
 	sb.WriteString(`<Buckets>`)
 	for _, bucketName := range bucketsList {
 		sb.WriteString(fmt.Sprintf("<Bucket><Name>%s</Name><CreationDate>%s</CreationDate></Bucket>", 
 			bucketName, time.Now().Format("2006-01-02T15:04:05.000Z")))
 	}
 	sb.WriteString(`</Buckets>`)
-	sb.WriteString(`<Owner><ID>s3rudder-owner-id</ID><DisplayName>s3rudder</DisplayName></Owner>`)
 	sb.WriteString(`</ListAllMyBucketsResult>`)
 	fmt.Fprint(w, sb.String())
 }

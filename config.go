@@ -87,6 +87,7 @@ type ServerConfig struct {
 	Port      int    `yaml:"port"`
 	AccessKey string `yaml:"access_key"`
 	SecretKey string `yaml:"secret_key"`
+	Domain    string `yaml:"domain"`
 }
 
 // Config is the top-level configuration structure.

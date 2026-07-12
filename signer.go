@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -199,7 +200,11 @@ func ResignRequest(r *http.Request, backend *Backend, payloadHash string) error 
 
 func buildCanonicalRequest(r *http.Request, signedHeaders []string, payloadHash string) string {
 	method := r.Method
-	canonicalURI := canonicalizeURI(r.URL.Path)
+	path := r.URL.Path
+	if r.URL.RawPath != "" {
+		path = r.URL.RawPath
+	}
+	canonicalURI := canonicalizeURI(path)
 	canonicalQuery := canonicalizeQuery(r.URL.RawQuery)
 	canonicalHeaders := canonicalizeHeaders(r, signedHeaders)
 	joinedHeaders := strings.Join(signedHeaders, ";")
@@ -239,31 +244,80 @@ func hmacSHA256(key []byte, data string) []byte {
 }
 
 
+func escapeRFC3986(s string, encodeSlash bool) string {
+	var sb strings.Builder
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '~' || c == '.' {
+			sb.WriteByte(c)
+		} else if c == '/' && !encodeSlash {
+			sb.WriteByte(c)
+		} else {
+			sb.WriteString(fmt.Sprintf("%%%02X", c))
+		}
+	}
+	return sb.String()
+}
+
 func canonicalizeURI(path string) string {
-	if path == "" {
+	if path == "" || path == "/" {
 		return "/"
 	}
-	return path
+	segments := strings.Split(path, "/")
+	for i, seg := range segments {
+		if unescaped, err := url.PathUnescape(seg); err == nil {
+			seg = unescaped
+		}
+		segments[i] = escapeRFC3986(seg, true)
+	}
+	result := strings.Join(segments, "/")
+	if !strings.HasPrefix(result, "/") {
+		result = "/" + result
+	}
+	return result
+}
+
+type queryParam struct {
+	key string
+	val string
 }
 
 func canonicalizeQuery(rawQuery string) string {
 	if rawQuery == "" {
 		return ""
 	}
-	// Parse and sort query params, excluding X-Amz-Signature.
 	pairs := strings.Split(rawQuery, "&")
-	var filtered []string
+	var params []queryParam
 	for _, pair := range pairs {
-		if strings.HasPrefix(pair, "X-Amz-Signature=") {
+		if pair == "" {
 			continue
 		}
-		if !strings.Contains(pair, "=") {
-			pair = pair + "="
+		k, v, _ := strings.Cut(pair, "=")
+		if strings.EqualFold(k, "X-Amz-Signature") {
+			continue
 		}
-		filtered = append(filtered, pair)
+		if uk, err := url.QueryUnescape(k); err == nil {
+			k = uk
+		}
+		if uv, err := url.QueryUnescape(v); err == nil {
+			v = uv
+		}
+		params = append(params, queryParam{
+			key: escapeRFC3986(k, true),
+			val: escapeRFC3986(v, true),
+		})
 	}
-	sort.Strings(filtered)
-	return strings.Join(filtered, "&")
+	sort.Slice(params, func(i, j int) bool {
+		if params[i].key == params[j].key {
+			return params[i].val < params[j].val
+		}
+		return params[i].key < params[j].key
+	})
+	var parts []string
+	for _, p := range params {
+		parts = append(parts, p.key+"="+p.val)
+	}
+	return strings.Join(parts, "&")
 }
 
 func canonicalizeHeaders(r *http.Request, signedHeaders []string) string {

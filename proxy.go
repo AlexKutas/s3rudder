@@ -380,7 +380,7 @@ func (rt *Router) handlePassthrough(w http.ResponseWriter, r *http.Request) {
 	b := candidates[0]
 	log.Printf("[proxy] passthrough %s %s → %s", r.Method, r.URL.RequestURI(), b.Config.Name)
 
-	_, objectKey := rt.parseS3Path(r)
+	bucket, objectKey := rt.parseS3Path(r)
 	resp, err := rt.forwardHTTPToBackend(r, b, objectKey)
 	if err != nil {
 		log.Printf("[proxy] passthrough forward error on %s: %v", b.Config.Name, err)
@@ -392,11 +392,22 @@ func (rt *Router) handlePassthrough(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(resp.Body)
 	log.Printf("[proxy] passthrough response from %s: status=%d body=%s", b.Config.Name, resp.StatusCode, string(body))
 
+	if bucket != "" && b.Config.Bucket != "" && bucket != b.Config.Bucket {
+		bodyStr := string(body)
+		bodyStr = strings.ReplaceAll(bodyStr, "<Name>"+b.Config.Bucket+"</Name>", "<Name>"+bucket+"</Name>")
+		bodyStr = strings.ReplaceAll(bodyStr, "<Bucket>"+b.Config.Bucket+"</Bucket>", "<Bucket>"+bucket+"</Bucket>")
+		body = []byte(bodyStr)
+	}
+
 	for k, vs := range resp.Header {
+		if strings.EqualFold(k, "Content-Length") {
+			continue
+		}
 		for _, v := range vs {
 			w.Header().Add(k, v)
 		}
 	}
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
 	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(body)
 }
@@ -454,6 +465,7 @@ func (rt *Router) forwardHTTPToBackend(r *http.Request, b *Backend, objectKey st
 		outReq.URL.Host = bucketHost
 		outReq.Host = bucketHost
 	}
+	outReq.URL.RawPath = ""
 
 	payloadHash := r.Header.Get("x-amz-content-sha256")
 	if payloadHash == "" {

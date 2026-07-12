@@ -163,7 +163,10 @@ func ResignRequest(r *http.Request, backend *Backend, payloadHash string) error 
 	dateTimeStr := now.Format("20060102T150405Z")
 
 	r.Header.Set("x-amz-date", dateTimeStr)
-	if payloadHash != "" {
+	if payloadHash != "" && payloadHash != "UNSIGNED-PAYLOAD" {
+		r.Header.Set("x-amz-content-sha256", payloadHash)
+	} else if r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodDelete || r.ContentLength == 0 {
+		payloadHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 		r.Header.Set("x-amz-content-sha256", payloadHash)
 	} else {
 		r.Header.Set("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
@@ -345,7 +348,7 @@ func collectSignedHeaders(r *http.Request) []string {
 	headers := []string{"host"}
 	for k := range r.Header {
 		lower := strings.ToLower(k)
-		if strings.HasPrefix(lower, "x-amz-") {
+		if strings.HasPrefix(lower, "x-amz-") || lower == "content-type" || lower == "content-md5" || lower == "range" {
 			headers = append(headers, lower)
 		}
 	}

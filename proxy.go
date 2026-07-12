@@ -195,10 +195,27 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (rt *Router) filterBackendsForBucket(bucket string) []*Backend {
+	if bucket == "" {
+		return rt.backends
+	}
+	var matched []*Backend
+	for _, b := range rt.backends {
+		if b.Config.Bucket == bucket {
+			matched = append(matched, b)
+		}
+	}
+	if len(matched) > 0 {
+		return matched
+	}
+	return rt.backends
+}
+
 // ── Read (GET / HEAD) ─────────────────────────────────────────────────────────
 
 func (rt *Router) handleRead(w http.ResponseWriter, r *http.Request, objectKey string) {
-	candidates := SelectReadBackends(rt.backends, rt.cfg.Routing.ReadPolicy)
+	bucket, _ := rt.parseS3Path(r)
+	candidates := SelectReadBackends(rt.filterBackendsForBucket(bucket), rt.cfg.Routing.ReadPolicy)
 	if len(candidates) == 0 {
 		writeS3Error(w, http.StatusServiceUnavailable, "ServiceUnavailable", "no healthy backends")
 		return
@@ -294,7 +311,8 @@ func (rt *Router) proxyRead(w http.ResponseWriter, r *http.Request, b *Backend, 
 // ── Write (PUT) ───────────────────────────────────────────────────────────────
 
 func (rt *Router) handleWrite(w http.ResponseWriter, r *http.Request, objectKey string) {
-	primary := SelectWriteBackend(rt.backends)
+	bucket, _ := rt.parseS3Path(r)
+	primary := SelectWriteBackend(rt.filterBackendsForBucket(bucket))
 	if primary == nil {
 		writeS3Error(w, http.StatusServiceUnavailable, "ServiceUnavailable", "no healthy backends")
 		return
@@ -372,15 +390,14 @@ func (rt *Router) handleDelete(w http.ResponseWriter, r *http.Request, objectKey
 // ── Passthrough (ListObjects, CreateMultipartUpload, etc.) ────────────────────
 
 func (rt *Router) handlePassthrough(w http.ResponseWriter, r *http.Request) {
-	candidates := SelectReadBackends(rt.backends, "failover")
+	bucket, objectKey := rt.parseS3Path(r)
+	candidates := SelectReadBackends(rt.filterBackendsForBucket(bucket), "failover")
 	if len(candidates) == 0 {
 		writeS3Error(w, http.StatusServiceUnavailable, "ServiceUnavailable", "no healthy backends")
 		return
 	}
 	b := candidates[0]
 	log.Printf("[proxy] passthrough %s %s → %s", r.Method, r.URL.RequestURI(), b.Config.Name)
-
-	bucket, objectKey := rt.parseS3Path(r)
 	resp, err := rt.forwardHTTPToBackend(r, b, objectKey)
 	if err != nil {
 		log.Printf("[proxy] passthrough forward error on %s: %v", b.Config.Name, err)
@@ -465,11 +482,15 @@ func (rt *Router) forwardHTTPToBackend(r *http.Request, b *Backend, objectKey st
 		outReq.URL.Host = bucketHost
 		outReq.Host = bucketHost
 	}
-	outReq.URL.RawPath = ""
+	outReq.URL.RawPath = canonicalizeURI(outReq.URL.Path)
 
 	payloadHash := r.Header.Get("x-amz-content-sha256")
 	if payloadHash == "" {
-		payloadHash = "UNSIGNED-PAYLOAD"
+		if r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodDelete || r.ContentLength == 0 {
+			payloadHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+		} else {
+			payloadHash = "UNSIGNED-PAYLOAD"
+		}
 	}
 	if err := ResignRequest(outReq, b, payloadHash); err != nil {
 		return nil, fmt.Errorf("resign: %w", err)

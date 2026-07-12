@@ -172,6 +172,12 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// ── 3. Route by method ────────────────────────────────────────────────
 	switch r.Method {
 	case http.MethodGet, http.MethodHead:
+		if r.URL.RawQuery == "location" || strings.Contains(r.URL.RawQuery, "location") {
+			w.Header().Set("Content-Type", "application/xml")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?>` + "\n" + `<LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/"/>`))
+			return
+		}
 		// Bucket-level operations (ListObjects, GetBucketLocation, etc.)
 		// have no object key — forward them directly to the backend.
 		if objectKey == "" {
@@ -332,6 +338,9 @@ func (rt *Router) handleWrite(w http.ResponseWriter, r *http.Request, objectKey 
 
 	// Relay response headers and status to the client.
 	for k, vs := range resp.Header {
+		if strings.EqualFold(k, "x-amz-bucket-region") {
+			continue
+		}
 		for _, v := range vs {
 			w.Header().Add(k, v)
 		}
@@ -417,7 +426,7 @@ func (rt *Router) handlePassthrough(w http.ResponseWriter, r *http.Request) {
 	}
 
 	for k, vs := range resp.Header {
-		if strings.EqualFold(k, "Content-Length") {
+		if strings.EqualFold(k, "Content-Length") || strings.EqualFold(k, "x-amz-bucket-region") {
 			continue
 		}
 		for _, v := range vs {
@@ -440,6 +449,9 @@ func (rt *Router) forwardHTTP(w http.ResponseWriter, r *http.Request, b *Backend
 	}
 	defer resp.Body.Close()
 	for k, vs := range resp.Header {
+		if strings.EqualFold(k, "x-amz-bucket-region") {
+			continue
+		}
 		for _, v := range vs {
 			w.Header().Add(k, v)
 		}

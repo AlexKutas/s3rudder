@@ -162,7 +162,9 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// ── 2. Authenticate ───────────────────────────────────────────────────
 	if err := ValidateRequest(r, rt.cfg.Server.AccessKey, rt.cfg.Server.SecretKey); err != nil {
-		log.Printf("[proxy] auth error: %v", err)
+		if err.Error() != "missing Authorization header" {
+			log.Printf("[proxy] auth error: %v", err)
+		}
 		writeS3Error(w, http.StatusForbidden, "AccessDenied", err.Error())
 		return
 	}

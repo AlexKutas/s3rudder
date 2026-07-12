@@ -284,6 +284,20 @@ volumes:
   queue-data:
 ```
 
+### Important Note on Cloudflare & Reverse Proxies (DNS Only / Gray Cloud Recommended)
+
+If you are exposing S3Rudder on a custom domain (e.g. `s3rudder.example.com`) and managing your DNS through **Cloudflare**, we strongly recommend setting your DNS records to **DNS Only (Gray Cloud)** rather than proxied (**Orange Cloud**).
+
+#### Why Cloudflare Proxying (Orange Cloud) is Not Recommended for S3 Traffic:
+1. **Upload Size Limits (`413 Request Entity Too Large`):** Cloudflare enforces a strict request body size limit of **100 MB** on Free and Pro plans (200 MB on Business). If your client uploads an object or multipart chunk exceeding this limit, Cloudflare blocks the request before it reaches S3Rudder.
+2. **Connection Timeouts (`524 A Timeout Occurred`):** Cloudflare drops HTTP connections that do not complete within **100 seconds**. When streaming large backup files or handling long-running synchronization tasks across slower object storage backends, connections through Cloudflare proxy will frequently time out and break.
+3. **Header Mutation & SigV4 Cryptographic Verification:** S3 clients (`AWS SDK`, `Cyberduck`) compute strict SigV4 HMAC signatures across specific HTTP headers (`Accept-Encoding`, `Host`, etc.). While S3Rudder includes intelligent proxy signature normalization, edge CDNs like Cloudflare dynamically mutate compression headers (`gzip, br`) and hop-by-hop headers, which can introduce unexpected signature mismatches (`Auth error: signature mismatch`).
+4. **Cloudflare Terms of Service:** Section 2.8 of Cloudflare's non-Enterprise Terms of Service prohibits caching or proxying high-volume non-HTML/media/storage payloads over their CDN without Cloudflare R2.
+
+#### Recommended Production Architecture:
+- Set `s3rudder.example.com` (and `*.s3rudder.example.com` if using Virtual-Hosted style) to **DNS Only (Gray Cloud)**.
+- Terminate SSL/TLS directly on your origin server using a reverse proxy like **Traefik**, **Nginx**, or **Caddy** with automated Let's Encrypt / ACME certificates.
+
 ## How Failover Works
 
 1. Client sends `GET /bucket/file.jpg` → S3Rudder
@@ -301,16 +315,76 @@ volumes:
 5. If a replication attempt fails, it is retried with exponential backoff (up to `retry_limit` times)
 6. Exhausted tasks are moved to a dead-letter bucket in BoltDB for manual inspection
 
+## Path-Style vs Virtual-Hosted Style Requests
+
+Understanding how URLs are formatted between your client, **S3Rudder**, and your storage backends is essential when configuring custom domains and multi-provider setups.
+
+```
+[Inbound Client Request]                        [Outbound Backend Proxying]
+Client / AWS SDK                                S3Rudder
+   │                                               │
+   ├── Path-Style (Recommended)                    ├── path_style: true (MinIO, R2, Hetzner)
+   │   https://s3rudder.domain.com/bucket/key      │   https://endpoint.com/bucket/key
+   │                                               │
+   └── Virtual-Hosted Style                        └── path_style: false (AWS S3, Wasabi)
+       https://bucket.s3rudder.domain.com/key          https://bucket.endpoint.com/key
+```
+
+### 1. Inbound (Client → S3Rudder)
+
+S3Rudder transparently supports **both** Path-Style and Virtual-Hosted Style requests from any S3-compatible tool (`aws-cli`, `aws-sdk-go-v2`, `boto3`, `Cyberduck`, etc.).
+
+#### Why Path-Style is Strongly Recommended for Clients
+When you point an S3 client to a custom domain (e.g., `https://s3rudder.example.com`), most modern AWS SDKs default to **Virtual-Hosted Style** (`https://<bucket>.s3rudder.example.com/`).
+If you use Virtual-Hosted Style, you **must** configure two things in your infrastructure:
+1. **Wildcard DNS (`*.s3rudder.example.com`):** A `CNAME` or `A` record pointing to your server.
+2. **Wildcard TLS Certificate (`*.s3rudder.example.com`):** Your reverse proxy (`Traefik`, `Nginx`, `Caddy`) must obtain an ACME / Let's Encrypt certificate with wildcard SAN (`Subject Alternative Name`).
+
+To avoid needing Wildcard DNS and Wildcard SSL certificates, simply enable **Path-Style requests** in your S3 client so all traffic flows directly through `https://s3rudder.example.com/bucket/key`:
+
+- **AWS SDK for Go v2:**
+  ```go
+  client := s3.NewFromConfig(cfg, func(o *s3.Options) {
+      o.UsePathStyle = true
+      o.BaseEndpoint = aws.String("https://s3rudder.example.com")
+  })
+  ```
+- **AWS CLI:**
+  ```bash
+  aws s3 cp file.txt s3://my-bucket/ --endpoint-url https://s3rudder.example.com
+  # Note: AWS CLI automatically falls back to path-style for custom endpoints
+  ```
+- **Cyberduck / Mountain Duck:**
+  Use the **S3 (Deprecated path style requests)** connection profile (`<key>Path Style Requests</key><true/>`), or connect directly using Path-Style addressing.
+
+---
+
+### 2. Outbound (S3Rudder → Backend Providers)
+
+The `path_style: true | false` option in your `config.yaml` tells S3Rudder how to format URLs when re-signing (`SigV4`) and forwarding requests to your storage backends:
+
+- **`path_style: true` (Path-Style URLs):**
+  S3Rudder sends requests to `https://backend-endpoint.com/bucket-name/object-key`.
+  *Required for:* `MinIO`, `Cloudflare R2`, `Backblaze B2`, `Hetzner Object Storage`, `Ceph / RGW`, and most self-hosted or non-AWS S3 providers.
+- **`path_style: false` (Virtual-Hosted Style URLs):**
+  S3Rudder rewrites the Host header and sends requests to `https://bucket-name.backend-endpoint.com/object-key`.
+  *Required for:* standard `AWS S3` and providers like `Wasabi`.
+
+S3Rudder automatically intercepts regional discovery queries (`GET /bucket/?location`) and rewrites internal backend bucket names inside XML responses (`ListObjectsV2`), ensuring clients never get redirected away from the S3Rudder proxy.
+
+---
+
 ## Supported S3 Providers
 
 | Provider | `path_style` | Notes |
 |----------|-------------|-------|
-| AWS S3 | `false` | Virtual-hosted style; use the region-specific endpoint |
-| Cloudflare R2 | `true` | Set `region: auto` |
-| Backblaze B2 | `true` | Use S3-compatible endpoint |
-| Wasabi | `false` | Use regional endpoint |
-| MinIO | `true` | Path-style required |
-| Any S3-compatible API | varies | Check provider docs |
+| **AWS S3** | `false` | Virtual-hosted style (`bucket.s3.region.amazonaws.com`) |
+| **Wasabi** | `false` / `true` | Supports path-style (`true`) or virtual-hosted style (`false`) |
+| **Cloudflare R2** | `true` | Path-style required; set `region: auto` |
+| **Backblaze B2** | `true` | Path-style required; use S3-compatible endpoint |
+| **Hetzner Object Storage** | `true` | Path-style required (`hel1.your-objectstorage.com/bucket/key`) |
+| **MinIO / Ceph RGW** | `true` | Path-style required (`endpoint:port/bucket/key`) |
+| **Any S3-compatible API** | varies | Check provider documentation for path-style support |
 
 ## License
 

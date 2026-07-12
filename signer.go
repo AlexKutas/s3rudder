@@ -78,8 +78,13 @@ func ValidateRequest(r *http.Request, accessKey, secretKey string) error {
 	sig := computeSignature(secretKey, t.Format("20060102"), region, "s3", stringToSign)
 
 	if !hmac.Equal([]byte(sig), []byte(fields["Signature"])) {
-		if matchedHost, _, _, ok := tryResolveHostSignature(r, signedHeaders, payloadHash, credScope, region, secretKey, fields["Signature"], t); ok {
+		if matchedHost, matchedAE, _, _, ok := tryResolveHostSignature(r, signedHeaders, payloadHash, credScope, region, secretKey, fields["Signature"], t); ok {
 			r.Host = matchedHost
+			if matchedAE != "" {
+				r.Header.Set("Accept-Encoding", matchedAE)
+			} else {
+				r.Header.Del("Accept-Encoding")
+			}
 			return nil
 		}
 		log.Printf("[signer] signature mismatch!\nCalculated: %s\nClient:     %s\nStringToSign:\n%s\nCanonicalRequest:\n%s",
@@ -125,8 +130,13 @@ func validateQueryRequest(r *http.Request, accessKey, secretKey string) error {
 	computedSig := computeSignature(secretKey, t.Format("20060102"), region, "s3", stringToSign)
 
 	if !hmac.Equal([]byte(computedSig), []byte(sig)) {
-		if matchedHost, _, _, ok := tryResolveHostSignature(r, signedHeaders, payloadHash, credScope, region, secretKey, sig, t); ok {
+		if matchedHost, matchedAE, _, _, ok := tryResolveHostSignature(r, signedHeaders, payloadHash, credScope, region, secretKey, sig, t); ok {
 			r.Host = matchedHost
+			if matchedAE != "" {
+				r.Header.Set("Accept-Encoding", matchedAE)
+			} else {
+				r.Header.Del("Accept-Encoding")
+			}
 			return nil
 		}
 		return fmt.Errorf("signature mismatch")
@@ -356,20 +366,57 @@ func collectSignedHeaders(r *http.Request) []string {
 	return headers
 }
 
-func tryResolveHostSignature(r *http.Request, signedHeaders []string, payloadHash, credScope, region, secretKey, expectedSig string, t time.Time) (string, string, string, bool) {
+func tryResolveHostSignature(r *http.Request, signedHeaders []string, payloadHash, credScope, region, secretKey, expectedSig string, t time.Time) (string, string, string, string, bool) {
 	origHost := r.Host
-	defer func() { r.Host = origHost }()
+	origAE := r.Header.Get("Accept-Encoding")
+	defer func() {
+		r.Host = origHost
+		if origAE != "" {
+			r.Header.Set("Accept-Encoding", origAE)
+		} else {
+			r.Header.Del("Accept-Encoding")
+		}
+	}()
 
-	for _, candidate := range generateHostCandidates(r) {
-		r.Host = candidate
-		canonical := buildCanonicalRequest(r, signedHeaders, payloadHash)
-		stringToSign := buildStringToSign(t, credScope, canonical)
-		sig := computeSignature(secretKey, t.Format("20060102"), region, "s3", stringToSign)
-		if hmac.Equal([]byte(sig), []byte(expectedSig)) {
-			return candidate, canonical, stringToSign, true
+	var aeCandidates []string
+	hasAE := false
+	for _, h := range signedHeaders {
+		if h == "accept-encoding" {
+			hasAE = true
+			break
 		}
 	}
-	return "", "", "", false
+	if hasAE {
+		seen := map[string]bool{}
+		for _, c := range []string{origAE, "identity", "gzip", "gzip, br", ""} {
+			if !seen[c] {
+				seen[c] = true
+				aeCandidates = append(aeCandidates, c)
+			}
+		}
+	} else {
+		aeCandidates = []string{origAE}
+	}
+
+	for _, hostCandidate := range generateHostCandidates(r) {
+		r.Host = hostCandidate
+		for _, aeCandidate := range aeCandidates {
+			if hasAE {
+				if aeCandidate != "" {
+					r.Header.Set("Accept-Encoding", aeCandidate)
+				} else {
+					r.Header.Del("Accept-Encoding")
+				}
+			}
+			canonical := buildCanonicalRequest(r, signedHeaders, payloadHash)
+			stringToSign := buildStringToSign(t, credScope, canonical)
+			sig := computeSignature(secretKey, t.Format("20060102"), region, "s3", stringToSign)
+			if hmac.Equal([]byte(sig), []byte(expectedSig)) {
+				return hostCandidate, aeCandidate, canonical, stringToSign, true
+			}
+		}
+	}
+	return "", "", "", "", false
 }
 
 func generateHostCandidates(r *http.Request) []string {

@@ -77,6 +77,10 @@ func ValidateRequest(r *http.Request, accessKey, secretKey string) error {
 	sig := computeSignature(secretKey, t.Format("20060102"), region, "s3", stringToSign)
 
 	if !hmac.Equal([]byte(sig), []byte(fields["Signature"])) {
+		if matchedHost, _, _, ok := tryResolveHostSignature(r, signedHeaders, payloadHash, credScope, region, secretKey, fields["Signature"], t); ok {
+			r.Host = matchedHost
+			return nil
+		}
 		log.Printf("[signer] signature mismatch!\nCalculated: %s\nClient:     %s\nStringToSign:\n%s\nCanonicalRequest:\n%s",
 			sig, fields["Signature"], stringToSign, canonical)
 		return fmt.Errorf("signature mismatch")
@@ -120,6 +124,10 @@ func validateQueryRequest(r *http.Request, accessKey, secretKey string) error {
 	computedSig := computeSignature(secretKey, t.Format("20060102"), region, "s3", stringToSign)
 
 	if !hmac.Equal([]byte(computedSig), []byte(sig)) {
+		if matchedHost, _, _, ok := tryResolveHostSignature(r, signedHeaders, payloadHash, credScope, region, secretKey, sig, t); ok {
+			r.Host = matchedHost
+			return nil
+		}
 		return fmt.Errorf("signature mismatch")
 	}
 	return nil
@@ -289,6 +297,61 @@ func collectSignedHeaders(r *http.Request) []string {
 	}
 	sort.Strings(headers)
 	return headers
+}
+
+func tryResolveHostSignature(r *http.Request, signedHeaders []string, payloadHash, credScope, region, secretKey, expectedSig string, t time.Time) (string, string, string, bool) {
+	origHost := r.Host
+	defer func() { r.Host = origHost }()
+
+	for _, candidate := range generateHostCandidates(r) {
+		r.Host = candidate
+		canonical := buildCanonicalRequest(r, signedHeaders, payloadHash)
+		stringToSign := buildStringToSign(t, credScope, canonical)
+		sig := computeSignature(secretKey, t.Format("20060102"), region, "s3", stringToSign)
+		if hmac.Equal([]byte(sig), []byte(expectedSig)) {
+			return candidate, canonical, stringToSign, true
+		}
+	}
+	return "", "", "", false
+}
+
+func generateHostCandidates(r *http.Request) []string {
+	seen := make(map[string]bool)
+	var list []string
+	add := func(h string) {
+		h = strings.TrimSpace(h)
+		if h != "" && !seen[h] {
+			seen[h] = true
+			list = append(list, h)
+		}
+	}
+
+	add(r.Host)
+	add(r.Header.Get("Host"))
+
+	if xfh := r.Header.Get("X-Forwarded-Host"); xfh != "" {
+		for _, part := range strings.Split(xfh, ",") {
+			add(part)
+		}
+	}
+
+	baseList := append([]string{}, list...)
+	xfp := r.Header.Get("X-Forwarded-Port")
+
+	for _, h := range baseList {
+		hostOnly := h
+		if idx := strings.IndexByte(h, ':'); idx != -1 {
+			hostOnly = h[:idx]
+		}
+		add(hostOnly)
+		add(hostOnly + ":443")
+		add(hostOnly + ":80")
+		add(hostOnly + ":8080")
+		if xfp != "" {
+			add(hostOnly + ":" + strings.TrimSpace(xfp))
+		}
+	}
+	return list
 }
 
 // GeneratePresignedURL returns a Pre-signed URL for the given object on the
